@@ -1,159 +1,430 @@
-import numpy as np
+"""unet_segmentation_v5.py
+=================================
+End‑to‑end training script for foreground/background segmentation from
+sparse scribbles **without** any external pre‑training.
+
+Key changes vs. previous versions
+---------------------------------
+1. **Patch‑based training** – each batch now contains 256×256 crops that are
+   guaranteed to include labelled pixels ⇒ far richer supervision.
+2. **Masked, class‑balanced BCE + Dice loss** – computed only on pixels that
+   are not 255.
+3. **Masked IoU metric** – drives LR schedule / early stopping without being
+   polluted by unlabeled pixels.
+4. **Clean UNet** – BatchNorm + Dropout + Conv2DTranspose upsampling.
+5. **Prediction pipeline** – resizes / pads back to the original size, then
+   optional morphology to remove salt‑and‑pepper noise and finally saves a
+   500 × 375 mask, as required by the challenge.
+
+If you still want to experiment with Random‑Walker pseudo‑labels, set
+`USE_PSEUDO = True` and the code will switch automatically.
+"""
+
 import os
+import random
+import numpy as np
+import cv2
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
+from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping
 from util import load_dataset, store_predictions, visualize
-from skimage.segmentation import random_walker
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-import sys
 
-# ----------- Configuration -----------
-TARGET_SIZE = (375, 500)  # (height, width) for final output masks
+# ---------------------------------------------------------------------------
+# 0.  Reproducibility --------------------------------------------------------
+# ---------------------------------------------------------------------------
+SEED = 2025
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
 
-# ----------- Load Data -----------
+# ---------------------------------------------------------------------------
+# 1.  Configuration ----------------------------------------------------------
+# ---------------------------------------------------------------------------
+TARGET_SIZE = (375, 500)  # (h, w) final mask size for submission
+PATCH       = 256         # training patch size
+BATCH       = 4
+EPOCHS      = 120
+USE_PSEUDO  = False       # set True to train on Random‑Walker masks instead
+
+# ---------------------------------------------------------------------------
+# 2.  Dataset loading --------------------------------------------------------
+# ---------------------------------------------------------------------------
 images_train, scrib_train, gt_train, fnames_train, palette = load_dataset(
-    "dataset/train", "images", "scribbles", "ground_truth"
-)
-images_test, _, fnames_test = load_dataset(
-    "dataset/test1", "images", "scribbles"
-)
+    "dataset/train", "images", "scribbles", "ground_truth")
+images_test, _, fnames_test = load_dataset("dataset/test1", "images", "scribbles")
 
-# ----------- 1. Generate Pseudo-Labels with Random Walker (on original images) -----------
-def expand_scribble(img, scribble):
-    # Ensure scribble is 2D
-    if scribble.ndim == 3:
-        scribble = scribble[..., 0]
-    
-    # Reverting to grayscale since the installed scikit-image is old.
-    img_float = img.astype(np.float32) / 255.0
-    img_gray = (img_float[..., 0] * 0.299 + img_float[..., 1] * 0.587 + img_float[..., 2] * 0.114)
+# Normalise images to [0,1]
+images_train = images_train.astype(np.float32) / 255.0
+images_test  = images_test.astype(np.float32)  / 255.0
 
-    # Remap scribble values for random_walker:
-    # Unlabeled (255) -> 0
-    # Background (0)   -> 1
-    # Foreground (1)   -> 2
-    seeds = np.zeros_like(scribble, dtype=np.int32)
-    seeds[scribble == 0] = 1  # Background seed
-    seeds[scribble == 1] = 2  # Foreground seed
-    # Pixels that were 255 remain 0, which is what random_walker expects for "unlabeled".
-    
-    # Using grayscale and a more moderate beta value as a hyperparameter refinement.
-    mask = random_walker(img_gray, seeds, beta=500, mode='bf')
+# ---------------------------------------------------------------------------
+# 3.  Optional Random‑Walker pseudo‑labels -----------------------------------
+# ---------------------------------------------------------------------------
+if USE_PSEUDO:
+    from skimage.segmentation import random_walker
 
-    # The output mask will have values 1 (from background seed) and 2 (from foreground seed).
-    # We want a binary mask where foreground is 1 and background is 0.
-    return (mask == 2).astype(np.uint8)
+    def make_rw_mask(img, scrib):
+        if scrib.ndim == 3:
+            scrib = scrib[..., 0]
+        gray = (img[..., 0]*0.299 + img[..., 1]*0.587 + img[..., 2]*0.114)
+        seeds = np.full_like(scrib, -1, dtype=np.int32)
+        seeds[scrib == 0] = 0          # background
+        seeds[scrib == 1] = 1          # foreground
+        mask = random_walker(gray, seeds, beta=80, mode='bf')
+        return (mask == 1).astype(np.uint8)
 
-print("Generating pseudo-labels with Random Walker...")
-pseudo_masks_train = np.stack([
-    expand_scribble(img, scr)
-    for img, scr in zip(images_train, scrib_train)
-], axis=0)
-print("Pseudo-label generation complete.")
+    print("Generating Random‑Walker masks …")
+    rw_masks = np.stack([make_rw_mask(img, scr)
+                         for img, scr in zip(images_train, scrib_train)], axis=0)
+    mask_train = rw_masks[..., np.newaxis].astype(np.float32)
+    print("Done.")
+else:
+    # use scribbles directly (0/1 labelled, 255 unknown)
+    mask_train = scrib_train[..., np.newaxis].astype(np.float32)
 
-# ----------- 2. Pre-processing and Padding -----------
-images_train_processed = images_train.astype(np.float32) / 255.0
+# ---------------------------------------------------------------------------
+# 4.  Utility – pad / unpad to multiple of 8 --------------------------------
+# ---------------------------------------------------------------------------
 
-def pad_to_multiple(img, multiple=8):
+def pad_to_multiple(arr, m=8, value=0):
+    h, w = arr.shape[:2]
+    ph = (m - h % m) % m
+    pw = (m - w % m) % m
+    if ph == 0 and pw == 0:
+        return arr
+    pad_spec = ((0, ph), (0, pw)) + (() if arr.ndim == 2 else ((0, 0),))
+    return np.pad(arr, pad_spec, mode='constant', constant_values=value)
+
+# Pad all training images & masks so they share identical shapes
+images_train = np.array([pad_to_multiple(im) for im in images_train])
+mask_train   = np.array([pad_to_multiple(msk) for msk in mask_train])
+
+# ---------------------------------------------------------------------------
+# 5.  Patch extraction -------------------------------------------------------
+# ---------------------------------------------------------------------------
+
+def np_random_patch(img, msk):
+    """Return a PATCH×PATCH crop that contains ≥ some labelled pixels."""
     h, w = img.shape[:2]
-    pad_h = (multiple - h % multiple) % multiple
-    pad_w = (multiple - w % multiple) % multiple
-    if pad_h == 0 and pad_w == 0: return img
-    return np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)) if img.ndim == 3 else ((0, pad_h), (0, pad_w)), mode='constant')
+    for _ in range(10):
+        top  = np.random.randint(0, h-PATCH+1)
+        left = np.random.randint(0, w-PATCH+1)
+        patch_img = img[top:top+PATCH, left:left+PATCH]
+        patch_msk = msk[top:top+PATCH, left:left+PATCH]
+        # ensure at least ~50 labelled pixels
+        lab = (patch_msk != 255) if not USE_PSEUDO else (patch_msk > 0)
+        if lab.sum() > 50:
+            return patch_img, patch_msk
+    # fallback – return last crop even if mostly unlabeled
+    return patch_img, patch_msk
 
-images_train_padded = np.array([pad_to_multiple(img) for img in images_train_processed])
-# Now pad the DENSE pseudo-masks
-y_train_padded = np.array([pad_to_multiple(mask) for mask in pseudo_masks_train])
-y_train_padded = np.expand_dims(y_train_padded, -1).astype(np.float32)
 
-# ----------- 1. U-Net with BatchNorm and Refactored Blocks -----------
-def conv_block(x, filters, drop=0.3):
-    x = layers.Conv2D(filters, 3, padding='same', activation=None)(x)
+def tf_random_patch(img, msk):
+    img, msk = tf.numpy_function(np_random_patch, [img, msk], [tf.float32, tf.float32])
+    img.set_shape([PATCH, PATCH, 3])
+    msk.set_shape([PATCH, PATCH, 1])
+    return img, msk
+
+# ---------------------------------------------------------------------------
+# 6.  Augmentations ----------------------------------------------------------
+# ---------------------------------------------------------------------------
+
+def augment(img, msk):
+    if tf.random.uniform(()) > 0.5:
+        img  = tf.image.flip_left_right(img)
+        msk  = tf.image.flip_left_right(msk)
+    if tf.random.uniform(()) > 0.5:
+        img  = tf.image.flip_up_down(img)
+        msk  = tf.image.flip_up_down(msk)
+    if tf.random.uniform(()) > 0.5:
+        img = tf.image.random_brightness(img, 0.12)
+    if tf.random.uniform(()) > 0.5:
+        img = tf.image.random_contrast(img, 0.9, 1.1)
+    return img, msk
+
+# Build tf.data pipeline
+N = len(images_train)
+val_split = int(0.15 * N)
+
+full_ds = tf.data.Dataset.from_tensor_slices((images_train, mask_train))
+train_ds = (full_ds.skip(val_split)
+            .map(tf_random_patch, num_parallel_calls=tf.data.AUTOTUNE)
+            .map(augment,          num_parallel_calls=tf.data.AUTOTUNE)
+            .batch(BATCH)
+            .prefetch(tf.data.AUTOTUNE))
+val_ds   = (full_ds.take(val_split)
+            .map(tf_random_patch, num_parallel_calls=tf.data.AUTOTUNE)
+            .batch(BATCH)
+            .prefetch(tf.data.AUTOTUNE))
+
+# ---------------------------------------------------------------------------
+# 7.  Enhanced UNet definition with Attention and Residual Connections -----
+# ---------------------------------------------------------------------------
+
+def squeeze_excite_block(x, ratio=16):
+    """Squeeze-and-Excitation block for channel attention"""
+    filters = x.shape[-1]
+    se = layers.GlobalAveragePooling2D()(x)
+    se = layers.Dense(filters // ratio, activation='relu')(se)
+    se = layers.Dense(filters, activation='sigmoid')(se)
+    se = layers.Reshape((1, 1, filters))(se)
+    return layers.Multiply()([x, se])
+
+def attention_gate(g, x):
+    """Attention gate for skip connections"""
+    g_filters = g.shape[-1]
+    x_filters = x.shape[-1]
+    
+    g_conv = layers.Conv2D(g_filters, 1, padding='same')(g)
+    x_conv = layers.Conv2D(g_filters, 1, padding='same')(x)
+    
+    add = layers.Add()([g_conv, x_conv])
+    relu = layers.ReLU()(add)
+    
+    psi = layers.Conv2D(1, 1, padding='same', activation='sigmoid')(relu)
+    
+    return layers.Multiply()([x, psi])
+
+def residual_conv_block(x, filters, dropout_rate=0.1):
+    """Residual convolution block with squeeze-excitation"""
+    shortcut = x
+    
+    # First conv block
+    x = layers.Conv2D(filters, 3, padding='same', use_bias=False)(x)
     x = layers.BatchNormalization()(x)
     x = layers.ReLU()(x)
-    x = layers.Conv2D(filters, 3, padding='same', activation=None)(x)
+    x = layers.Dropout(dropout_rate)(x)
+    
+    # Second conv block
+    x = layers.Conv2D(filters, 3, padding='same', use_bias=False)(x)
     x = layers.BatchNormalization()(x)
+    
+    # Squeeze-and-Excitation
+    x = squeeze_excite_block(x)
+    
+    # Residual connection
+    if shortcut.shape[-1] != filters:
+        shortcut = layers.Conv2D(filters, 1, padding='same', use_bias=False)(shortcut)
+        shortcut = layers.BatchNormalization()(shortcut)
+    
+    x = layers.Add()([x, shortcut])
     x = layers.ReLU()(x)
-    return layers.Dropout(drop)(x)
+    x = layers.Dropout(dropout_rate)(x)
+    
+    return x
 
-def unet(input_shape):
+def enhanced_unet(input_shape=(None, None, 3)):
+    """Enhanced U-Net with attention, residual connections, and deeper architecture"""
     inputs = keras.Input(shape=input_shape)
-    c1 = conv_block(inputs, 16, drop=0.1); p1 = layers.MaxPooling2D()(c1)
-    c2 = conv_block(p1, 32, drop=0.1); p2 = layers.MaxPooling2D()(c2)
-    c3 = conv_block(p2, 64, drop=0.2); p3 = layers.MaxPooling2D()(c3)
-    b  = conv_block(p3, 128, drop=0.3)
-    u3 = layers.UpSampling2D()(b); u3 = layers.concatenate([u3, c3]); c4 = conv_block(u3, 64, drop=0.2)
-    u2 = layers.UpSampling2D()(c4); u2 = layers.concatenate([u2, c2]); c5 = conv_block(u2, 32, drop=0.1)
-    u1 = layers.UpSampling2D()(c5); u1 = layers.concatenate([u1, c1]); c6 = conv_block(u1, 16, drop=0.1)
-    outputs = layers.Conv2D(1, 1, activation='sigmoid')(c6)
-    return keras.Model(inputs, outputs)
-
-# ----------- 2. Class-Balanced Loss Function -----------
-def dice_loss(y_true, y_pred, smooth=1e-6):
-    y_t = tf.cast(tf.reshape(y_true, [-1]), tf.float32); y_p = tf.reshape(y_pred, [-1])
-    intersection = tf.reduce_sum(y_t * y_p)
-    return 1 - (2. * intersection + smooth) / (tf.reduce_sum(y_t) + tf.reduce_sum(y_p) + smooth)
-
-def masked_weighted_bce(y_true, y_pred):
-    y_t = tf.cast(tf.reshape(y_true, [-1]), tf.float32); y_p = tf.reshape(y_pred, [-1])
-    pos = tf.reduce_sum(y_t); neg = tf.reduce_sum(1.0 - y_t)
-    alpha = neg / (pos + neg + 1e-6); beta = pos / (pos + neg + 1e-6)
-    weights = y_t * alpha + (1 - y_t) * beta
-    bce = tf.keras.losses.binary_crossentropy(y_t, y_p)
-    return tf.reduce_mean(bce * weights)
-
-def combined_loss(y_true, y_pred):
-    return masked_weighted_bce(y_true, y_pred) + dice_loss(y_true, y_pred)
-
-# ----------- Data Augmentation and Pipeline -----------
-def augment(image, mask):
-    # Basic Flips
-    if tf.random.uniform(()) > 0.5: image = tf.image.flip_left_right(image); mask = tf.image.flip_left_right(mask)
-    if tf.random.uniform(()) > 0.5: image = tf.image.flip_up_down(image); mask = tf.image.flip_up_down(mask)
     
-    # Color Augmentation
-    if tf.random.uniform(()) > 0.5: image = tf.image.random_brightness(image, max_delta=0.1)
-    if tf.random.uniform(()) > 0.5: image = tf.image.random_contrast(image, lower=0.9, upper=1.1)
+    # Encoder with increasing filters and residual blocks
+    # Level 1
+    c1 = residual_conv_block(inputs, 64, 0.05)
+    c1 = residual_conv_block(c1, 64, 0.05)
+    p1 = layers.MaxPooling2D(2)(c1)
+    
+    # Level 2
+    c2 = residual_conv_block(p1, 128, 0.1)
+    c2 = residual_conv_block(c2, 128, 0.1)
+    p2 = layers.MaxPooling2D(2)(c2)
+    
+    # Level 3
+    c3 = residual_conv_block(p2, 256, 0.15)
+    c3 = residual_conv_block(c3, 256, 0.15)
+    p3 = layers.MaxPooling2D(2)(c3)
+    
+    # Level 4
+    c4 = residual_conv_block(p3, 512, 0.2)
+    c4 = residual_conv_block(c4, 512, 0.2)
+    p4 = layers.MaxPooling2D(2)(c4)
+    
+    # Bottleneck with ASPP (Atrous Spatial Pyramid Pooling)
+    # Multiple dilated convolutions to capture multi-scale context
+    aspp1 = layers.Conv2D(1024, 1, padding='same', activation='relu')(p4)
+    aspp6 = layers.Conv2D(1024, 3, padding='same', dilation_rate=6, activation='relu')(p4)
+    aspp12 = layers.Conv2D(1024, 3, padding='same', dilation_rate=12, activation='relu')(p4)
+    aspp18 = layers.Conv2D(1024, 3, padding='same', dilation_rate=18, activation='relu')(p4)
+    
+    # Simplified global context - just use the ASPP branches without global pooling
+    bottleneck = layers.Concatenate()([aspp1, aspp6, aspp12, aspp18])
+    bottleneck = layers.Conv2D(1024, 1, padding='same', activation='relu')(bottleneck)
+    bottleneck = layers.BatchNormalization()(bottleneck)
+    bottleneck = layers.Dropout(0.3)(bottleneck)
+    
+    # Decoder with attention gates and skip connections
+    # Level 4 decode
+    u4 = layers.Conv2DTranspose(512, 2, strides=2, padding='same')(bottleneck)
+    att4 = attention_gate(u4, c4)
+    u4 = layers.Concatenate()([u4, att4])
+    c5 = residual_conv_block(u4, 512, 0.2)
+    c5 = residual_conv_block(c5, 512, 0.2)
+    
+    # Level 3 decode
+    u3 = layers.Conv2DTranspose(256, 2, strides=2, padding='same')(c5)
+    att3 = attention_gate(u3, c3)
+    u3 = layers.Concatenate()([u3, att3])
+    c6 = residual_conv_block(u3, 256, 0.15)
+    c6 = residual_conv_block(c6, 256, 0.15)
+    
+    # Level 2 decode
+    u2 = layers.Conv2DTranspose(128, 2, strides=2, padding='same')(c6)
+    att2 = attention_gate(u2, c2)
+    u2 = layers.Concatenate()([u2, att2])
+    c7 = residual_conv_block(u2, 128, 0.1)
+    c7 = residual_conv_block(c7, 128, 0.1)
+    
+    # Level 1 decode
+    u1 = layers.Conv2DTranspose(64, 2, strides=2, padding='same')(c7)
+    att1 = attention_gate(u1, c1)
+    u1 = layers.Concatenate()([u1, att1])
+    c8 = residual_conv_block(u1, 64, 0.05)
+    c8 = residual_conv_block(c8, 64, 0.05)
+    
+    # Final output - simplified to single output for now
+    main_output = layers.Conv2D(1, 1, activation='sigmoid', name='main_output')(c8)
+    
+    model = keras.Model(inputs, main_output)
+    return model
+
+# Create the enhanced model
+model = enhanced_unet()
+print("Enhanced U-Net Architecture:")
+model.summary(line_length=120)
+
+# ---------------------------------------------------------------------------
+# 8.  Enhanced Loss & metrics with Deep Supervision ------------------------
+# ---------------------------------------------------------------------------
+
+def masked_bce(y_t, y_p):
+    mask = tf.not_equal(y_t, 255.0)
+    y_t  = tf.boolean_mask(y_t, mask)
+    y_p  = tf.boolean_mask(y_p, mask)
+    # class weighting
+    pos = tf.reduce_sum(y_t)
+    neg = tf.reduce_sum(1.0 - y_t)
+    alpha = neg / (pos + neg + 1e-6)
+    beta  = pos / (pos + neg + 1e-6)
+    w = y_t * alpha + (1 - y_t) * beta
+    bce = tf.keras.backend.binary_crossentropy(y_t, y_p)
+    return tf.reduce_mean(w * bce)
+
+
+def masked_dice(y_t, y_p, smooth=1e-6):
+    mask = tf.not_equal(y_t, 255.0)
+    y_t  = tf.boolean_mask(y_t, mask)
+    y_p  = tf.boolean_mask(y_p, mask)
+    inter = tf.reduce_sum(y_t * y_p)
+    return 1 - (2*inter + smooth) / (tf.reduce_sum(y_t) + tf.reduce_sum(y_p) + smooth)
+
+
+def total_loss(y_t, y_p):
+    return masked_bce(y_t, y_p) + masked_dice(y_t, y_p)
+
+
+def masked_iou(y_t, y_p):
+    mask = tf.not_equal(y_t, 255.0)
+    y_t  = tf.boolean_mask(y_t, mask)
+    y_p  = tf.cast(tf.boolean_mask(y_p, mask) > 0.5, tf.float32)
+    inter = tf.reduce_sum(y_t * y_p)
+    union = tf.reduce_sum(y_t) + tf.reduce_sum(y_p) - inter
+    return inter / (union + 1e-6)
+
+def deep_supervision_loss(y_true, y_pred_list, weights=[1.0, 0.5, 0.25]):
+    """Combined loss with deep supervision from multiple outputs"""
+    total_loss = 0
+    for i, (y_pred, weight) in enumerate(zip(y_pred_list, weights)):
+        # Resize y_true to match y_pred if needed
+        if y_pred.shape[1:3] != y_true.shape[1:3]:
+            y_true_resized = tf.image.resize(y_true, y_pred.shape[1:3])
+        else:
+            y_true_resized = y_true
         
-    # Note: Rotation is more complex and can change image shape. For simplicity, we'll stick to color/flips for now.
+        loss = masked_bce(y_true_resized, y_pred) + masked_dice(y_true_resized, y_pred)
+        total_loss += weight * loss
     
-    return image, mask
+    return total_loss
 
-dataset_size = len(images_train_padded); val_size = int(0.2 * dataset_size); train_size = dataset_size - val_size
-full_dataset = tf.data.Dataset.from_tensor_slices((images_train_padded, y_train_padded)).shuffle(buffer_size=dataset_size)
-train_ds = full_dataset.take(train_size).map(augment, num_parallel_calls=tf.data.AUTOTUNE).batch(2).prefetch(tf.data.AUTOTUNE)
-val_ds = full_dataset.skip(train_size).batch(2).prefetch(tf.data.AUTOTUNE)
+def combined_model_loss(y_true, y_pred):
+    """Wrapper for the multi-output model loss"""
+    main_out, aux_out_2, aux_out_4 = y_pred[0], y_pred[1], y_pred[2]
+    return deep_supervision_loss(y_true, [main_out, aux_out_2, aux_out_4])
 
-# ----------- 3. Model Setup with LR Scheduling -----------
-input_shape = images_train_padded.shape[1:]; model = unet(input_shape)
-model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4), loss=combined_loss, metrics=['accuracy'])
+def main_output_iou(y_true, y_pred):
+    """IoU metric for the main output only"""
+    main_output = y_pred[0] if isinstance(y_pred, list) else y_pred
+    return masked_iou(y_true, main_output)
 
+# Compile with enhanced loss and metrics for single output
+model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=5e-5),  # Lower LR for stability
+    loss=total_loss,
+    metrics=[masked_iou]
+)
+
+# Updated callbacks for single output
 callbacks = [
-    ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, verbose=1),
-    EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    ReduceLROnPlateau(monitor='val_masked_iou', mode='max', factor=0.7,
+                      patience=6, verbose=1, min_lr=1e-7),
+    EarlyStopping(monitor='val_masked_iou', mode='max', patience=15,
+                  restore_best_weights=True, verbose=1)
 ]
 
-model.fit(train_ds, epochs=100, validation_data=val_ds, callbacks=callbacks, verbose=1)
+# Train the enhanced model
+model.fit(train_ds, epochs=EPOCHS, validation_data=val_ds,
+          callbacks=callbacks, verbose=2)
 
-# ----------- Prediction and Saving (as before) -----------
-def predict_and_save(images, fnames, out_folder, palette):
-    preds = []
-    for img in images:
-        orig_h, orig_w, _ = img.shape
-        img_padded = pad_to_multiple(img.astype(np.float32) / 255.0)
-        pred = model.predict(np.expand_dims(img_padded, 0))[0, ..., 0]
-        # FIX: Invert the prediction. If model outputs < 0.5, it's foreground (1).
-        pred_mask = (pred < 0.5).astype(np.uint8)
-        cropped_mask = pred_mask[:orig_h, :orig_w]
-        preds.append(cropped_mask)
-    preds = np.stack(preds, axis=0)
-    store_predictions(preds, out_folder, "unet_predictions_v3", fnames, palette)
-    return preds
+# ---------------------------------------------------------------------------
+# 9.  Enhanced Prediction & saving for Multi-Output Model ------------------
+# ---------------------------------------------------------------------------
+THRESH = 0.4
 
-pred_train = predict_and_save(images_train, fnames_train, "dataset/train", palette)
-pred_test = predict_and_save(images_test, fnames_test, "dataset/test1", palette)
+def predict_mask(img):
+    """Predict binary mask for a single RGB uint8 image using enhanced U-Net."""
+    h0, w0, _ = img.shape
+    img_f = img.astype(np.float32) / 255.0
+    pad_img = pad_to_multiple(img_f)
+    
+    # Model returns single output
+    main_pred = model.predict(pad_img[np.newaxis])[0, ..., 0]
+    
+    # Crop back to original size
+    pr = main_pred[:h0, :w0]
+    pr_bin = (pr >= THRESH).astype(np.uint8)
+    
+    # Enhanced morphological cleaning with multiple kernel sizes
+    kernel_small = np.ones((3,3), np.uint8)
+    kernel_medium = np.ones((5,5), np.uint8)
+    
+    # Remove small noise
+    pr_clean = cv2.morphologyEx(pr_bin, cv2.MORPH_OPEN, kernel_small, iterations=1)
+    # Fill small holes
+    pr_clean = cv2.morphologyEx(pr_clean, cv2.MORPH_CLOSE, kernel_medium, iterations=1)
+    # Final smoothing
+    pr_clean = cv2.morphologyEx(pr_clean, cv2.MORPH_OPEN, kernel_small, iterations=1)
+    
+    # resize/crop to target 375×500
+    pr_resized = cv2.resize(pr_clean, (TARGET_SIZE[1], TARGET_SIZE[0]),
+                            interpolation=cv2.INTER_NEAREST)
+    return pr_resized
 
-# ----------- Visualization -----------
-vis_index = np.random.randint(len(images_train))
-visualize(images_train[vis_index], scrib_train[vis_index], gt_train[vis_index], pred_train[vis_index])
+
+print("Saving predictions …")
+train_preds = np.stack([predict_mask((im*255).astype(np.uint8))
+                        for im in images_train], axis=0)
+store_predictions(train_preds, "dataset/train", "unet_v5", fnames_train, palette)
+
+test_preds = np.stack([predict_mask((im*255).astype(np.uint8))
+                       for im in images_test], axis=0)
+store_predictions(test_preds, "dataset/test1", "unet_v5", fnames_test, palette)
+print("Done.")
+
+# ---------------------------------------------------------------------------
+# 10. Quick qualitative check ----------------------------------------------
+# ---------------------------------------------------------------------------
+idx = np.random.randint(len(images_train))
+padded_scrib = pad_to_multiple(scrib_train[idx])
+visualize((images_train[idx]*255).astype(np.uint8),
+          padded_scrib,
+          pad_to_multiple(gt_train[idx]),
+          train_preds[idx])

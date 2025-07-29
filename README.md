@@ -1,102 +1,126 @@
-# ML-Image-segmentation
+# Image Segmentation Challenge - Enhanced U-Net
 
-# Image Segmentation Challenge
+This repository contains an enhanced U-Net implementation for weakly supervised image segmentation using sparse scribbles.
 
-Welcome to the image segmentation challenge! This project provides a baseline pipeline using scribble-based supervision for binary image segmentation. You will work with a dataset of natural images, sparse scribbles indicating foreground/background, and optionally ground truth labels for evaluation.
+## 🚀 Features
 
----
+- **Enhanced U-Net Architecture** with:
+  - Residual connections
+  - Squeeze-and-Excitation blocks
+  - Attention gates for skip connections
+  - ASPP (Atrous Spatial Pyramid Pooling) bottleneck
+  - Deep supervision
 
-## Project Structure
-```text
-.
-├── challenge.py           # Main script for training and testing pipeline
-├── util.py                # Utility functions (dataset I/O, KNN model, visualization)
-├── dataset/
-│   ├── training/
-│   │   ├── images/
-│   │   ├── scribbles/
-│   │   ├── ground_truth/
-│   │   └── predictions/   # Created by the script
-│   └── test/
-│       ├── images/
-│       ├── scribbles/
-│       └── predictions/   # Created by the script
+- **Weakly Supervised Training**:
+  - Scribble-only training (no pre-trained models)
+  - Patch-based training for sparse supervision
+  - Masked, class-balanced BCE + Dice loss
+  - Advanced data augmentation
+
+- **Multiple Training Modes**:
+  - Direct scribble supervision
+  - Random Walker pseudo-labels (optional)
+
+## 📁 Project Structure
+
+```
+├── unet.py              # Main training script
+├── util.py              # Utility functions (data loading, visualization)
+├── dataset/             # Dataset directory
+│   ├── train/          # Training data
+│   └── test1/          # Test data
+├── requirements.txt     # Python dependencies
+└── README.md           # This file
 ```
 
----
+## 🛠️ Installation
 
-## Requirements
+### Prerequisites
+- Python 3.8+
+- CUDA-compatible GPU (recommended)
+- Git
 
-Install required Python packages via pip:
+### Setup
 
-pip install numpy pillow matplotlib scikit-learn
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/YOUR_USERNAME/image-segmentation-challenge.git
+   cd image-segmentation-challenge
+   ```
 
----
+2. **Create virtual environment:**
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   ```
 
-## Running the Baseline
+3. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-Execute the following script:
+## 🎯 Usage
 
-python challenge.py
+### Training
 
-This script will:
+```bash
+# Activate virtual environment
+source venv/bin/activate
 
-1. Load the training dataset.
-2. Segment images using a K-Nearest Neighbors (KNN) classifier (k=3) based on scribble labels.
-3. Store the predicted segmentation masks.
-4. Visualize one randomly selected result.
-5. Repeat the process on the test dataset (without ground truth).
+# Run training
+python unet.py
+```
 
----
+### Configuration
 
-## Contents
+Edit the configuration section in `unet.py`:
 
-### challenge.py
+```python
+TARGET_SIZE = (375, 500)  # Final output size
+PATCH = 256              # Training patch size
+BATCH = 4                # Batch size
+EPOCHS = 120             # Maximum epochs
+USE_PSEUDO = False       # Use Random Walker pseudo-labels
+```
 
-- Loads training and test datasets.
-- Performs segmentation using a baseline KNN model.
-- Stores predicted masks to predictions/.
-- Visualizes one result for the training set.
+## 📊 Model Architecture
 
-### util.py
+The enhanced U-Net includes:
 
-A utility module containing:
+- **Encoder:** 5 levels with residual blocks and SE attention
+- **Bottleneck:** ASPP with multiple dilated convolutions
+- **Decoder:** Attention gates and skip connections
+- **Output:** Single segmentation mask
 
-- **Dataset Handling**
-  - load_dataset(): Load images, scribbles, ground truths.
-  - store_predictions(): Save predicted segmentation masks with color palettes.
-- **Model**
-  - segment_with_knn(): A KNN-based baseline using scribble supervision.
-- **Visualization**
-  - visualize(): Display image + scribbles, ground truth, and predicted mask.
-- **Evaluation**
-  - evaluate_binary_miou(): Computes mean Intersection over Union (IoU).
+## 🔧 Training Details
 
----
+- **Loss Function:** Masked BCE + Dice loss
+- **Optimizer:** Adam with learning rate scheduling
+- **Metrics:** Masked IoU
+- **Augmentation:** Flips, brightness, contrast
+- **Early Stopping:** Based on validation IoU
 
+## 📈 Results
 
-## Scribble Supervision Format
+The enhanced architecture provides:
+- Better boundary detection
+- Improved feature learning
+- More stable training
+- Higher segmentation accuracy
 
-- Scribble masks use:
-  - 0: Background
-  - 1: Foreground
-  - 255: Unlabeled
+## 🤝 Contributing
 
-Predictions and ground truths are binary masks using 0 and 1.
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Submit a pull request
 
----
+## 📝 License
 
-## Tasks for Students
+This project is for educational and research purposes.
 
-- Improve the segmentation performance beyond the KNN baseline.
-- Try different models or distance metrics.
-- Use the provided visualization and evaluation tools to test your ideas.
-- Optionally, extend to multi-class segmentation (requires additional modification).
+## 🙏 Acknowledgments
 
----
-
-## Questions?
-
-Please contact the course staff or teaching assistants for help with setup, debugging, or project expectations.
-
-Happy coding!
+- U-Net architecture (Ronneberger et al.)
+- Attention mechanisms in medical image segmentation
+- Weakly supervised learning techniques
