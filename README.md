@@ -1,126 +1,136 @@
-# Image Segmentation Challenge - Enhanced U-Net
+# Image Segmentation Challenge — Enhanced U-Net (Simple Pipeline)
 
-This repository contains an enhanced U-Net implementation for weakly supervised image segmentation using sparse scribbles.
+This repository provides a clean, reliable pipeline for weakly supervised image segmentation using an enhanced U-Net. The main entry point is `unet_simple.py`, which supports a quick 2‑image overfit sanity check and a full class‑balanced training run.
 
-## 🚀 Features
+## Features
 
-- **Enhanced U-Net Architecture** with:
-  - Residual connections
-  - Squeeze-and-Excitation blocks
-  - Attention gates for skip connections
-  - ASPP (Atrous Spatial Pyramid Pooling) bottleneck
-  - Deep supervision
+- **Enhanced U-Net** with a clear, minimal architecture
+- **Weakly supervised** training from scribbles (no pretrained models)
+- **Two modes** in one script:
+  - `OVERFIT_TWO`: prove learning on two images
+  - `FULL_CLASS_BALANCED`: full training with weighted BCE + Dice + extras
+- **TTA + simple post‑processing** at inference
 
-- **Weakly Supervised Training**:
-  - Scribble-only training (no pre-trained models)
-  - Patch-based training for sparse supervision
-  - Masked, class-balanced BCE + Dice loss
-  - Advanced data augmentation
-
-- **Multiple Training Modes**:
-  - Direct scribble supervision
-  - Random Walker pseudo-labels (optional)
-
-## 📁 Project Structure
+## Project structure
 
 ```
-├── unet.py              # Main training script
-├── util.py              # Utility functions (data loading, visualization)
-├── dataset/             # Dataset directory
-│   ├── train/          # Training data
-│   └── test1/          # Test data
-├── requirements.txt     # Python dependencies
-└── README.md           # This file
+├── unet_simple.py          # Main training/inference script (use this)
+├── util.py                 # Dataset I/O, storage, visualization utilities
+├── dataset/
+│   ├── train/              # Training set
+│   └── test1/              # Test set
+├── requirements.txt        # Python dependencies
+└── README.md               # This file
 ```
 
-## 🛠️ Installation
+Other scripts (e.g., `unet.py`, `challenge.py`) are legacy/baseline references.
 
-### Prerequisites
-- Python 3.8+
-- CUDA-compatible GPU (recommended)
-- Git
+## Setup
 
-### Setup
-
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/YOUR_USERNAME/image-segmentation-challenge.git
-   cd image-segmentation-challenge
-   ```
-
-2. **Create virtual environment:**
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
-
-3. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-## 🎯 Usage
-
-### Training
+### Option A: Python venv
 
 ```bash
-# Activate virtual environment
-source venv/bin/activate
-
-# Run training
-python unet.py
+python3 -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-### Configuration
+### Option B: Conda
 
-Edit the configuration section in `unet.py`:
+```bash
+conda create -y -n seg_env python=3.9
+conda activate seg_env
+pip install -r requirements.txt
+```
+
+Notes:
+- Python 3.8+ recommended (tested with TF ≥ 2.8).
+- GPU support: install a TensorFlow build compatible with your CUDA/cuDNN stack if needed.
+
+## Dataset layout
+
+The script expects the following layout and filename conventions:
+
+```
+dataset/
+  train/
+    images/        # RGB images, filenames like XYZ.jpg
+    scribbles/     # scribble masks, filenames XYZ.png (0=bg, 1=fg, 255=unlabeled)
+    ground_truth/  # GT masks, filenames XYZ.png (0/1), used for training and metrics
+  test1/
+    images/        # RGB images XYZ.jpg
+    scribbles/     # scribbles XYZ.png
+```
+
+- Filenames must match by basename across folders (e.g., `123.jpg` ↔ `123.png`).
+- Paths can be changed by editing the top of `unet_simple.py`.
+
+## Quick start
+
+```bash
+# Activate your environment first (venv or conda)
+python unet_simple.py
+```
+
+By default, the script runs with `FULL_CLASS_BALANCED=True` and `OVERFIT_TWO=False`. Toggle these at the top of `unet_simple.py`:
 
 ```python
-TARGET_SIZE = (375, 500)  # Final output size
-PATCH = 256              # Training patch size
-BATCH = 4                # Batch size
-EPOCHS = 120             # Maximum epochs
-USE_PSEUDO = False       # Use Random Walker pseudo-labels
+OVERFIT_TWO = False          # set True to quickly overfit two samples
+FULL_CLASS_BALANCED = True   # set False to skip the full training
 ```
 
-## 📊 Model Architecture
+### What the script does
 
-The enhanced U-Net includes:
+- Loads data from `dataset/train` and `dataset/test1`
+- Trains an enhanced U-Net (with class‑balanced loss)
+- Applies TTA + optional DenseCRF refinement
+- Saves predictions to:
+  - `dataset/train/unet_balanced/`
+  - `dataset/test1/unet_balanced/`
+- If `OVERFIT_TWO=True`, also writes `dataset/train/unet_overfit_two/`
 
-- **Encoder:** 5 levels with residual blocks and SE attention
-- **Bottleneck:** ASPP with multiple dilated convolutions
-- **Decoder:** Attention gates and skip connections
-- **Output:** Single segmentation mask
+## Configuration highlights
 
-## 🔧 Training Details
+- Image sizes: `TRAIN_SIZE=(384, 512)`, final `TARGET_SIZE=(375, 500)`
+- Loss: weighted BCE + Dice (+ small focal and edge terms)
+- Metrics: IoU
+- Simple augmentation: horizontal flip
+- TTA: horizontal/vertical flips + multi‑scale at inference
 
-- **Loss Function:** Masked BCE + Dice loss
-- **Optimizer:** Adam with learning rate scheduling
-- **Metrics:** Masked IoU
-- **Augmentation:** Flips, brightness, contrast
-- **Early Stopping:** Based on validation IoU
+Adjust hyperparameters near the top of `unet_simple.py`:
 
-## 📈 Results
+```python
+BATCH_FULL  = 6
+EPOCHS_FULL = 150
+LR_FULL     = 3e-4
+THRESH_FULL = 0.30
+```
 
-The enhanced architecture provides:
-- Better boundary detection
-- Improved feature learning
-- More stable training
-- Higher segmentation accuracy
+## Requirements
 
-## 🤝 Contributing
+Install from `requirements.txt`:
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Submit a pull request
+```text
+tensorflow>=2.8.0
+numpy
+opencv-python
+scikit-image
+scikit-learn
+matplotlib
+Pillow
+```
 
-## 📝 License
+For GPU TensorFlow, install the version compatible with your CUDA/cuDNN.
 
-This project is for educational and research purposes.
+## Tips
 
-## 🙏 Acknowledgments
+- If filenames/extensions differ, edit `load_dataset` in `util.py` to match your naming.
+- Large runs: use `conda` with a CUDA‑enabled TensorFlow build.
+- To visualize results, see helpers in `util.py` (e.g., `visualize`).
 
-- U-Net architecture (Ronneberger et al.)
-- Attention mechanisms in medical image segmentation
-- Weakly supervised learning techniques
+## Clone
+
+```bash
+git clone https://github.com/AnupamVarshney/Image-segmentation-challenge-.git
+cd Image-segmentation-challenge-
+```
