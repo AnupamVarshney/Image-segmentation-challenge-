@@ -98,3 +98,5 @@ Predictions and ground truths are binary masks using 0 and 1.
 Please contact the course staff or teaching assistants for help with setup, debugging, or project expectations.
 
 Happy coding!
+
+source /home/anupam/miniconda3/bin/activate seg_env_clean 

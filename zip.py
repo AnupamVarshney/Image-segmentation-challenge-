@@ -2,7 +2,7 @@ import os
 import zipfile
 
 # Path to the folder containing U-Net predictions
-predictions_folder = 'dataset/test1/unet_predictions'
+predictions_folder = 'dataset/test1/unet_balanced'
 zip_path = 'dataset/test1/predictions.zip'
 
 # Create a zip file and add all files from the predictions folder

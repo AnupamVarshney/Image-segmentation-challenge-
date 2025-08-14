@@ -3,7 +3,7 @@ import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
 from sklearn.neighbors import KNeighborsClassifier
-from typing import Any
+from typing import Any, Union, Tuple, List
 
 
 ######### Methods for loading dataset
@@ -42,8 +42,8 @@ def load_dataset(
     folder_path: str,
     images_dir: str,
     scribbles_dir: str,
-    ground_truth_dir: str | None = None
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, Any]:
+    ground_truth_dir: Union[str, None] = None
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Any]:
     """
     Load images, scribbles, and ground truth masks from a dataset folder.
     This version is robust to filename mismatches by using basenames.
@@ -81,7 +81,7 @@ def store_predictions(
     predictions: np.ndarray,
     folder_path: str,
     predictions_dir: str,
-    filenames: list[str],
+    filenames: List[str],
     palette: Any
 ):
     """Takes a stack of segmented images and stores them indvidually in the given folder.
